@@ -79,6 +79,12 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt install -y \
             python3 python-is-python3 git curl bc bison flex libssl-dev libelf-dev zip rsync
 
+      - name: Install repo tool
+        run: |
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
+          chmod a+x ~/repo
+          sudo mv ~/repo /usr/local/bin/repo
+
       - name: Show selected inputs
         run: |
           echo "Device:          $DEVICE_NAME ($DEVICE_MODEL)"
@@ -91,34 +97,56 @@ jobs:
           echo "KPM:             ${{ inputs.KPM }}"
           echo "ZRAM:            ${{ inputs.ZRAM }}"
 
-      # Realme publishes OSS as plain git repos (no `repo` manifest like OnePlus).
-      # The vendor-source repo IS the kernel_platform skeleton (build/, oplus/, tools/...).
-      # We drop the GKI common and MSM vendor kernels into kernel_platform/{common,msm-kernel}.
-      - name: Clone Realme GT8 Pro kernel sources
+      # Realme's OSS ships only 3 repos (common / soc-repo / device) but the kleaf build needs
+      # the full OPPO/Google kernel_platform: prebuilts/clang, prebuilts/build-tools,
+      # external/bazel-*, build/bazel_common_rules, etc. Realme omits all of that.
+      #
+      # The GT8 Pro (canoe/SM8850/Android16/6.12) is the SAME platform as the OnePlus 15, so we
+      # sync the OnePlus sm8850 manifest to obtain that shared, compatible infrastructure, then
+      # overlay Realme's device sources (common, soc-repo, oplus) on top. The build produces the
+      # Realme kernel Image; only the toolchain/build-rules come from the OnePlus tree.
+      - name: Sync kleaf infra (OnePlus sm8850) + overlay Realme GT8 Pro sources
         run: |
           mkdir kernel_workspace && cd kernel_workspace
 
-          echo "==> Cloning vendor source (kernel_platform skeleton + vendor blobs)"
-          git clone --depth=1 "$VENDOR_REPO" tmp_vendor
-          mv tmp_vendor/kernel_platform ./kernel_platform
-          mv tmp_vendor/vendor ./vendor
-          rm -rf tmp_vendor
+          echo "==> repo init/sync OnePlus sm8850 (canoe) manifest for kleaf infrastructure"
+          repo init --depth=1 -u https://github.com/OnePlusOSS/kernel_manifest.git \
+            -b oneplus/sm8850 -m oneplus_15.xml
+          repo sync -c -j$(nproc --all) --no-tags --force-sync
 
-          echo "==> Cloning GKI common source -> kernel_platform/common"
+          echo "==> Overlay Realme GKI common -> kernel_platform/common"
+          rm -rf kernel_platform/common
           git clone --depth=1 "$COMMON_REPO" kernel_platform/common
 
-          echo "==> Cloning MSM vendor kernel source -> kernel_platform/msm-kernel"
-          git clone --depth=1 "$MSM_REPO" kernel_platform/msm-kernel
+          # SoC (Qualcomm/canoe) kernel MUST live at kernel_platform/soc-repo: the bazel package
+          # is //soc-repo and kernel_platform/{WORKSPACE,build_with_bazel.py,device.bazelrc} are
+          # symlinks into it (repo created them during sync; they now resolve to Realme's tree).
+          echo "==> Overlay Realme SoC kernel -> kernel_platform/soc-repo"
+          # qcom_build_extensions is a QCOM (SoC-generic) bazel extension that OnePlus ships in
+          # soc-repo (a repo linkfile build/qcom_build_extensions -> ../soc-repo/... points at it)
+          # but Realme's soc-repo omits. Preserve the OnePlus copy so the link stays valid.
+          cp kernel_platform/soc-repo/qcom_build_extensions /tmp/qcom_build_extensions 2>/dev/null || true
+          rm -rf kernel_platform/soc-repo
+          git clone --depth=1 "$MSM_REPO" kernel_platform/soc-repo
+          [ -f kernel_platform/soc-repo/qcom_build_extensions ] || \
+            cp /tmp/qcom_build_extensions kernel_platform/soc-repo/qcom_build_extensions 2>/dev/null || true
+
+          # Use Realme's oplus build system (matched to Realme's soc-repo module/feature lists).
+          echo "==> Overlay Realme oplus build system -> kernel_platform/oplus"
+          git clone --depth=1 "$VENDOR_REPO" _realme_vendor
+          rm -rf kernel_platform/oplus
+          cp -a _realme_vendor/kernel_platform/oplus kernel_platform/oplus
+          rm -rf _realme_vendor
 
           echo "==> Removing ABI protected-exports guards (KSU adds symbols)"
           if [ -e kernel_platform/common/BUILD.bazel ]; then
             sed -i '/^[[:space:]]*"protected_exports_list"[[:space:]]*:[[:space:]]*"android\/abi_gki_protected_exports_aarch64",$/d' kernel_platform/common/BUILD.bazel
           fi
-          if [ -e kernel_platform/msm-kernel/BUILD.bazel ]; then
-            sed -i '/^[[:space:]]*"protected_exports_list"[[:space:]]*:[[:space:]]*"android\/abi_gki_protected_exports_aarch64",$/d' kernel_platform/msm-kernel/BUILD.bazel
+          if [ -e kernel_platform/soc-repo/BUILD.bazel ]; then
+            sed -i '/^[[:space:]]*"protected_exports_list"[[:space:]]*:[[:space:]]*"android\/abi_gki_protected_exports_aarch64",$/d' kernel_platform/soc-repo/BUILD.bazel
           fi
           rm kernel_platform/common/android/abi_gki_protected_exports_* 2>/dev/null || echo "No protected exports (common)!"
-          rm kernel_platform/msm-kernel/android/abi_gki_protected_exports_* 2>/dev/null || echo "No protected exports (msm-kernel)!"
+          rm kernel_platform/soc-repo/android/abi_gki_protected_exports_* 2>/dev/null || echo "No protected exports (soc-repo)!"
 
       # The oplus_setup.sh shipped in the Realme OSS hardcodes the platform to 'sun' (SM8750)
       # for every input. The GT8 Pro is 'canoe' (SM8850), so force it here.
@@ -134,14 +162,14 @@ jobs:
       - name: Force remove -dirty suffix
         run: |
           cd kernel_workspace/kernel_platform
-          for sv in common/scripts/setlocalversion msm-kernel/scripts/setlocalversion external/dtc/scripts/setlocalversion; do
+          for sv in common/scripts/setlocalversion soc-repo/scripts/setlocalversion external/dtc/scripts/setlocalversion; do
             [ -f "$sv" ] && sed -i 's/ -dirty//g' "$sv"
           done
           if [ -f common/scripts/setlocalversion ]; then
             sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' common/scripts/setlocalversion
           fi
           # kernel_platform itself is not a git repo here, so commit inside each sub-repo instead.
-          for d in common msm-kernel; do
+          for d in common soc-repo; do
             if [ -d "$d/.git" ]; then
               git -C "$d" add -A
               git -C "$d" -c user.name=ci -c user.email=ci@ci commit -m "Force remove -dirty suffix" || true
@@ -263,10 +291,10 @@ jobs:
                 sed -i 's/"drivers\/block\/zram\/zram\.ko",//g; s/"mm\/zsmalloc\.ko",//g' "./common/modules.bzl"
               fi
 
-              if [ -e ./msm-kernel/modules.bzl ]; then
-                sed -i 's/"drivers\/block\/zram\/zram\.ko",//g; s/"mm\/zsmalloc\.ko",//g' "./msm-kernel/modules.bzl"
-                echo "CONFIG_ZSMALLOC=y" >> "msm-kernel/arch/arm64/configs/${{ env.CPUD }}-GKI.config"
-                echo "CONFIG_ZRAM=y" >> "msm-kernel/arch/arm64/configs/${{ env.CPUD }}-GKI.config"
+              if [ -e ./soc-repo/modules.bzl ]; then
+                sed -i 's/"drivers\/block\/zram\/zram\.ko",//g; s/"mm\/zsmalloc\.ko",//g' "./soc-repo/modules.bzl"
+                echo "CONFIG_ZSMALLOC=y" >> "soc-repo/arch/arm64/configs/${{ env.CPUD }}-GKI.config"
+                echo "CONFIG_ZRAM=y" >> "soc-repo/arch/arm64/configs/${{ env.CPUD }}-GKI.config"
               fi
 
               echo "CONFIG_MODULE_SIG_FORCE=n" >> "$CONFIG_FILE"
@@ -296,7 +324,7 @@ jobs:
           rm -rf ./AnyKernel3/.git
 
           dir1="kernel_workspace/kernel_platform/out/msm-kernel-${{ env.CPUD }}-${{ inputs.BUILD_METHOD }}/dist/"
-          dir2="kernel_workspace/kernel_platform/bazel-out/k8-fastbuild/bin/msm-kernel/${{ env.CPUD }}_gki_kbuild_mixed_tree/"
+          dir2="kernel_workspace/kernel_platform/bazel-out/k8-fastbuild/bin/soc-repo/${{ env.CPUD }}_gki_kbuild_mixed_tree/"
           dir3="kernel_workspace/kernel_platform/out/msm-${{ env.CPUD }}-${{ env.CPUD }}-${{ inputs.BUILD_METHOD }}/dist/"
           dir4="kernel_workspace/kernel_platform/out/msm-kernel-${{ env.CPUD }}-${{ inputs.BUILD_METHOD }}/gki_kernel/common/arch/arm64/boot/"
           dir5="kernel_workspace/kernel_platform/out/msm-${{ env.CPUD }}-${{ env.CPUD }}-${{ inputs.BUILD_METHOD }}/gki_kernel/common/arch/arm64/boot/"
