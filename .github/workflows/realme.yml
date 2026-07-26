@@ -63,6 +63,11 @@ jobs:
           remove-haskell: 'true'
           remove-codeql: 'true'
 
+      # Check out this repo so the helper scripts under .github/scripts are available.
+      # Runs after maximize-build-space so the checkout lands on the enlarged workspace.
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Configure Git
         run: |
           git config --global user.name "builder"
@@ -180,8 +185,15 @@ jobs:
         run: |
           cd kernel_workspace/kernel_platform/common
           cp ../../SukiSU_patch/69_hide_stuff.patch ./
-          echo "Applying app-hiding patch"
-          patch -p1 -F 3 < 69_hide_stuff.patch
+          echo "Applying app-hiding patch (task_mmu.c)"
+          # The base.c hunk was written for the pre-6.12 `*path = vma->vm_file->f_path;`
+          # form; Realme's 6.12 kernel uses file_user_path(), so that one hunk is rejected.
+          # Tolerate it here (task_mmu.c hunks still land) and apply an equivalent, 6.12-
+          # correct base.c change with the helper below.
+          patch -p1 -F 3 --no-backup-if-mismatch < 69_hide_stuff.patch || true
+          echo "Applying 6.12-compatible base.c hide patch"
+          python3 "$GITHUB_WORKSPACE/.github/scripts/fix_hide_stuff_base.py" fs/proc/base.c
+          rm -f fs/proc/base.c.rej fs/proc/base.c.orig fs/proc/task_mmu.c.rej fs/proc/task_mmu.c.orig
 
       - name: Apply LZ4KD
         run: |
